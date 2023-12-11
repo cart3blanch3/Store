@@ -5,6 +5,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.Xml.Serialization;
 using Newtonsoft.Json;
+using System.Security.Cryptography;
+using System.Runtime.Serialization;
 
 // Абстрактный базовый класс, представляющий товар
 public abstract class Product
@@ -229,11 +231,23 @@ public class ProductCollection<T> : ICollection<T> where T : Product
     {
         return GetEnumerator();
     }
-     
+
     // Метод асинхронной сортировки с использованием делегата Action
     public async Task SortProductsAsync(Action<List<T>> sortAction)
     {
-        await Task.Run(() => sortAction(products));
+        try
+        {
+            Logger.Log($"Начало сортировки: {DateTime.Now}");
+
+            await Task.Run(() => sortAction(products));
+
+            Logger.Log($"Конец сортировки: {DateTime.Now}");
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"Ошибка при сортировке: {ex.Message}");
+            // Дополнительные действия при ошибке, если необходимо
+        }
     }
 
 
@@ -308,14 +322,14 @@ public class Store
     }
 
     // Метод для получения списка продуктов в заданной категории
-    public List<Product> GetProductsInCategory(string category)
+    public ProductCollection<Product> GetProductsInCategory(string category)
     {
         if (productCategories.ContainsKey(category))
         {
-            return productCategories[category].ToList();
+            return productCategories[category];
         }
 
-        return new List<Product>();
+        return new ProductCollection<Product>();
     }
 
     // Метод для возвращения единой коллекции всех товаров
@@ -495,19 +509,26 @@ public class CashRegister
         // Увеличение выручки кассы
         decimal totalPrice = customer.ShoppingCart.CalculateTotalPrice();
 
-        // Оплата корзины покупателя
-        customer.Pay(totalPrice);
-
-        // Увеличиваем выручку кассы
-        totalRevenue += totalPrice;
-
-        PrintReceipt(customer);
+        if (totalPrice == 0)
+        {
+            Logger.Log("Корзина пуста.");
+            return;
+        }
 
         // Удаление купленных товаров из магазина
         foreach (var item in customer.ShoppingCart.GetItems())
         {
             Store.Instance.RemoveProduct(item);
         }
+
+        // Увеличиваем выручку кассы
+        totalRevenue += totalPrice;
+
+        // Оплата корзины покупателя
+        customer.Pay(totalPrice);
+
+        // Печатаем чек
+        PrintReceipt(customer);
 
         // Очищаем корзину
         customer.ShoppingCart.Clear();
@@ -521,11 +542,11 @@ public class CashRegister
 
         foreach (var item in customer.ShoppingCart.GetItems())
         {
-            Logger.Log($"- {item} = {item.CalculatePrice()}");
+            Logger.Log($"- {item} = {item.CalculatePrice()} руб.");
         }
 
         decimal totalPrice = customer.ShoppingCart.CalculateTotalPrice();
-        Logger.Log($"Итого: {totalPrice}₽");
+        Logger.Log($"Итого: {totalPrice} руб.");
         Logger.Log("----------------------------");
     }
 }
@@ -546,6 +567,7 @@ public class ConsoleLoggerSink : ILoggerSink
 public class FileLoggerSink : ILoggerSink
 {
     private readonly string filePath;
+    private readonly object fileLock = new object();
 
     public FileLoggerSink(string filePath)
     {
@@ -554,7 +576,18 @@ public class FileLoggerSink : ILoggerSink
 
     public void Log(string message)
     {
-        File.AppendAllText(filePath, $"{message}\n");
+        lock (fileLock)
+        {
+            try
+            {
+                File.AppendAllText(filePath, $"{message}\n");
+            }
+            catch (Exception ex)
+            {
+                // Явный выброс исключения для индикации ошибки без дополнительной обработки
+                throw new FileLoadException($"Ошибка доступа к файлу {filePath}", ex);
+            }
+        }
     }
 }
 
@@ -582,7 +615,14 @@ public class XmlSerializer : ISerializer
 
         using (var writer = new StreamWriter(filePath))
         {
-            serializer.Serialize(writer, data);
+            try
+            {
+                serializer.Serialize(writer, data);
+            }
+            catch (Exception ex)
+            {
+                throw new SerializationException($"Ошибка при записи в файл {filePath}.", ex);
+            }
         }
     }
 
@@ -592,7 +632,14 @@ public class XmlSerializer : ISerializer
 
         using (var reader = new StreamReader(filePath))
         {
-            return (T)serializer.Deserialize(reader);
+            try
+            {
+                return (T)serializer.Deserialize(reader);
+            }
+            catch (Exception ex)
+            {
+                throw new SerializationException($"Ошибка при чтении из файла {filePath}.", ex);
+            }
         }
     }
 }
@@ -601,14 +648,28 @@ public class JsonSerializer : ISerializer
 {
     public void Serialize<T>(string filePath, T data)
     {
-        var json = JsonConvert.SerializeObject(data);
-        File.WriteAllText(filePath, json);
+        try
+        {
+            var json = JsonConvert.SerializeObject(data);
+            File.WriteAllText(filePath, json);
+        }
+        catch (Exception ex)
+        {
+            throw new SerializationException($"Ошибка при записи в файл {filePath}.", ex);
+        }
     }
 
     public T Deserialize<T>(string filePath)
     {
-        var json = File.ReadAllText(filePath);
-        return JsonConvert.DeserializeObject<T>(json);
+        try
+        {
+            var json = File.ReadAllText(filePath);
+            return JsonConvert.DeserializeObject<T>(json);
+        }
+        catch (Exception ex)
+        {
+            throw new SerializationException($"Ошибка при чтении из файла {filePath}.", ex);
+        }
     }
 }
 
@@ -622,87 +683,109 @@ public class StoreException : Exception
 
 class Program
 {
-    static void Main()
+    static async Task Main()
     {
-        // Зарегистрируем источники вывода (консоль и файл)
-        ConsoleLoggerSink consoleLoggerSink = new ConsoleLoggerSink();
-        FileLoggerSink fileLoggerSink = new FileLoggerSink("log.txt");
-
-        Logger.LogEvent += consoleLoggerSink.Log;
-        Logger.LogEvent += fileLoggerSink.Log;
-
-        // Создаем экземпляр магазина
-        Store store = Store.Instance;
-
-        var xmlSerializer = new JsonSerializer();
-
-        store.AddProduct(new PackagedProduct(1, "Хлеб", "Хлебобулочные изд", 60, 10));
-        store.AddProduct(new PackagedProduct(1, "Хлеб", "Хлебобулочные изд", 60, 5));
-        store.AddProduct(new PackagedProduct(2, "Молоко", "Молочница", 100, 2));
-        store.AddProduct(new BulkProduct(3, "Булочка с маком", "Хлебобулочные изд", 25, 100));
-
-
-        //foreach (Product product in data)
-        //{
-        //    store.AddProduct(product);
-        //}
-
-        // Создаем экземпляр кассы
-        CashRegister cashRegister = new CashRegister();
-
-        // Создаем экземпляр покупателя
-        Customer customer = new Customer("Иван", 1000);
-
-        // Главный цикл интерфейса
-        while (true)
+        try
         {
-            Console.Clear();
-            Console.WriteLine("Выберите действие:");
-            Console.WriteLine("1. Каталог продуктов");
-            Console.WriteLine("2. Корзина");
-            Console.WriteLine("3. Оформить покупку");
-            Console.WriteLine("4. Проверка баланса");
-            Console.WriteLine("5. Выход");
+            // Зарегистрируем источники вывода (консоль и файл)
+            ConsoleLoggerSink consoleLoggerSink = new ConsoleLoggerSink();
+            FileLoggerSink fileLoggerSink = new FileLoggerSink("log.txt");
 
-            int choice = Prompt.Input<int>("Введите номер действия");
+            Logger.LogEvent += consoleLoggerSink.Log;
+            Logger.LogEvent += fileLoggerSink.Log;
 
-            switch (choice)
+            // Создаем экземпляр магазина
+            Store store = Store.Instance;
+
+            // Десериализация списка товаров из файла store.xml
+            var xmlSerializer = new XmlSerializer();
+            var data = xmlSerializer.Deserialize<ProductCollection<Product>>("store.xml");
+          
+            // Добавление товаров в магазин
+            foreach ( var item in data)
             {
-                case 1:
-                    // Отобразить каталог продуктов
-                    BrowseProductCategories(store, customer);
-                    Console.ReadKey();
-                    break;
-
-                case 2:
-                    // Действия с корзиной
-                    ShoppingCartActions(customer);
-                    Console.ReadKey();
-                    break;
-
-                case 3:
-                    cashRegister.ProcessPayment(customer);
-                    Console.ReadKey();
-                    break;
-                case 4:
-                    // Проверка баланса
-                    DisplayBalance(customer);
-                    Console.ReadKey();
-                    break;
-
-                case 5:
-                    xmlSerializer.Serialize("store.xml", store.GetAllProducts());
-                    var jsonSerializer = new JsonSerializer();
-                    jsonSerializer.Serialize("store.json", store.GetAllProducts());
-
-                    // Выход из программы
-                    Environment.Exit(0);
-                    break;
-
-                default:
-                    Console.WriteLine("Неверный выбор. Попробуйте снова.");
-                    break;
+                store.AddProduct(item);
             }
+
+            // Создаем экземпляр кассы
+            CashRegister cashRegister = new CashRegister();
+
+            // Создаем экземпляр покупателя
+            Customer customer = new Customer("Иван", 5000);
+
+            // Главный цикл интерфейса
+            while (true)
+            {
+                Console.Clear();
+                Console.WriteLine("Выберите действие:");
+                Console.WriteLine("1. Каталог продуктов");
+                Console.WriteLine("2. Корзина");
+                Console.WriteLine("3. Оформить покупку");
+                Console.WriteLine("4. Проверка баланса");
+                Console.WriteLine("5. Выход");
+
+                int choice = Prompt.Input<int>("Введите номер действия");
+
+                switch (choice)
+                {
+                    case 1:
+                        // Отобразить каталог продуктов
+                        BrowseProductCategories(store, customer);
+                        Console.ReadKey();
+                        break;
+
+                    case 2:
+                        // Действия с корзиной
+                        ShoppingCartActions(customer);
+                        Console.ReadKey();
+                        break;
+
+                    case 3:
+                        cashRegister.ProcessPayment(customer);
+                        Console.ReadKey();
+                        break;
+                    case 4:
+                        // Проверка баланса
+                        DisplayBalance(customer);
+                        Console.ReadKey();
+                        break;
+
+                    case 5:
+                        // Асинхронная сортировка и сериализация продуктов в разные файлы по категориям
+                        await Task.WhenAll(
+                            store.GetProductCategories().Select(async category =>
+                            {
+                                // Асинхронная сортировка продуктов в категории
+                                await store.GetProductsInCategory(category).SortProductsAsync(products =>
+                                    products.Sort((p1, p2) => string.Compare(p1.Name, p2.Name, StringComparison.Ordinal))
+                                );
+
+                                // Десериализация в формат XML
+                                var xmlSerializer = new XmlSerializer();
+                                xmlSerializer.Serialize($"store_{category.ToLower()}.xml", store.GetProductsInCategory(category));
+
+                                // Десериализация в формат JSON
+                                var jsonSerializer = new JsonSerializer();
+                                jsonSerializer.Serialize($"store_{category.ToLower()}.json", store.GetProductsInCategory(category));
+                            })
+                        );
+                        // Выход из программы
+                        Environment.Exit(0);
+                        break;
+
+                    default:
+                        Console.WriteLine("Неверный выбор. Попробуйте снова.");
+                        break;
+                }
+            }
+        }
+        catch (StoreException ex)
+        {
+            Logger.Log($"Пользовательская ошибка: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"Системная ошибка: {ex.Message}");
         }
     }
 
@@ -730,6 +813,34 @@ class Program
         // Вводим количество товара
         double quantity = Prompt.Input<double>("Введите количество товара");
 
+        // Проверка на отрицательное количество товара
+        if (quantity < 0)
+        {
+            Console.WriteLine("Количество товара не может быть отрицательным.");
+            Console.ReadLine();
+            return;
+        }
+
+        // Проверка наличия достаточного количества товара
+        if (selectedProduct is PackagedProduct packagedSelectedProduct)
+        {
+            if (quantity > packagedSelectedProduct.Quantity)
+            {
+                Console.WriteLine("Недостаточное количество товара в магазине.");
+                Console.ReadLine();
+                return;
+            }
+        }
+        if (selectedProduct is BulkProduct bulkSelectedProduct)
+        {
+           if (quantity > bulkSelectedProduct.Weight)
+            {
+                Console.WriteLine("Недостаточное количество товара в магазине.");
+                Console.ReadLine();
+                return;
+            }
+        }
+
         // Добавляем товар в корзину
         customer.ShoppingCart.AddItem(selectedProduct, quantity);
     }
@@ -737,7 +848,6 @@ class Program
     static void ShoppingCartActions(Customer customer)
     {
         Console.Clear();
-        Console.WriteLine("Содержимое корзины:");
         customer.ShoppingCart.DisplayCart();
 
         var itemsInCart = customer.ShoppingCart.GetItems();
